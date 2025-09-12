@@ -9,9 +9,9 @@ class ToyModel(torch.nn.Module):
         self.relu = torch.nn.ReLU()
 
     def forward(self, x):
-        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc1(x)) # fp16 cause linear
         print(f"type_relu = {x.dtype}")
-        x = self.ln(x)
+        x = self.ln(x) # fp32 cause
         print(f"type_ln = {x.dtype}")
         x = self.fc2(x)
         print(f"type_fc2 = {x.dtype}")
@@ -27,7 +27,8 @@ print("Default")
 m.forward(x)
 
 print("Autocast f16")
-dtype = torch.float16
+# dtype = torch.float16
+dtype = torch.bfloat16
 x = torch.zeros([batch, in_features], dtype=dtype, device='cuda')
 with torch.autocast('cuda', dtype=dtype):
     output = m(x)
