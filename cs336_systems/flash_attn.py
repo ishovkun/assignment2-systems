@@ -3,7 +3,6 @@ from torch import Tensor
 from jaxtyping import Float, Bool, Int
 import triton.language as tl
 from einops import rearrange, einsum
-from math import sqrt
 import pytest
 
 def cdiv(x: int, y: int):
@@ -13,58 +12,60 @@ def flash_attn_forward(
     Q: Float[Tensor, " ... queries d_k"],
     K: Float[Tensor, " ... keys    d_k"],
     V: Float[Tensor, " ... keys    d_v"],
-    causal: bool = False) -> tuple[Float[Tensor, " ... queries d_v"], Float[Tensor, "... queries"]]:
+    causal: bool = False
+) -> tuple[Float[Tensor, " ... queries d_v"], Float[Tensor, "... queries"]]:
+        assert len(Q.shape) == 4
+        assert len(K.shape) == 4
+        assert len(V.shape) == 4
+
         batch_size = Q.shape[0]
         num_heads = Q.shape[1]
         seq_len = Q.shape[2]
         d_k = Q.shape[3]
-        # d_v = V.shape[-1]
+        d_v = V.shape[3]
+        print(f"fattn for b={batch_size} h={num_heads} s={seq_len} d_k={d_k} d_v={d_v}")
 
-        softmax_scale = 1. / sqrt(d_k)
-        O = torch.zeros_like(Q)
+        softmax_scale = 1. / (d_k**0.5)
+        O = torch.zeros((batch_size, num_heads, seq_len, d_v), dtype=torch.float32)
         L = torch.zeros((batch_size, num_heads, seq_len, 1), dtype=torch.float32)
-        tileQ = 1 << 4
-        tileK = 1 << 4
+        # tileQ = 16
+        tileQ = seq_len
+        tileK = seq_len
 
-        for batch in range(batch_size):
-            for head in range(num_heads):
+        for b in range(batch_size):
+            for h in range(num_heads):
                 for q_chunk in range(cdiv(seq_len, tileQ)):
                     startI = q_chunk * tileQ
                     endI = min((q_chunk+1)*tileQ, seq_len)
-                    Qi = Q[batch, head, startI:endI, :]
+                    sliceI = (b, h, slice(startI, endI), slice(None))
                     m = torch.full((tileQ, 1), fill_value=-torch.inf, dtype=torch.float32)
                     l = torch.zeros((tileQ, 1), dtype=torch.float32)
+                    Qi = Q[sliceI]
                     for kv_chunk in range(cdiv(seq_len, tileK)):
+                        # Load K,V
                         startJ = kv_chunk * tileK
                         endJ = min((kv_chunk+1)*tileK, seq_len)
-                        Kj = K[batch, head, startJ:endJ, :]
-                        Vj = V[batch, head, startJ:endJ, :]
-
-                        Sij = einsum(Qi, Kj, "query d_k, key d_k -> query key")
-                        Sij *= softmax_scale
+                        sliceJ = (b, h, slice(startJ, endJ), slice(None))
+                        Kj = K[sliceJ]
+                        Vj = V[sliceJ]
+                        # Compute QK
+                        Sij = einsum(Qi, Kj, "query d_k, key d_k -> query key") * softmax_scale
+                        # Compute new row-max
                         m_cur = torch.max(Sij, dim=-1)[0].reshape(tileQ, 1)
-
-                        Pij = torch.exp(Sij - m_cur)
-                        l_cur = torch.sum(Sij, dim=-1).reshape(tileQ, 1)
-
                         m_new = torch.max(torch.stack( (m_cur, m) , dim=-1), dim=-1, keepdim=False)[0]
-                        l_new = l_cur * torch.exp(m - m_new) + l * torch.exp(m_cur - m_new)
-
-                        PV = Pij @ Vj
-
-                        O[batch, head, startI:endI,:] = \
-                                ((l * torch.exp(m - m_new) * O[batch, head, startI:endI,:]) +
-                                        (torch.exp(m_cur - m_new) * PV)) / l_new
+                        Pij = torch.exp(Sij - m_new)
+                        # Compute row-sum
+                        l_cur = torch.sum(Pij, dim=-1).reshape(tileQ, 1)
+                        l_new = torch.exp(m - m_new)*l + l_cur
+                        PV = einsum(Pij, Vj, "query key, key d_v -> query d_v")
+                        # Update O
+                        O[sliceI] = torch.exp(m - m_new) * O[sliceI] + PV
 
                         m = m_new
                         l = l_new
-                        nan_count = torch.sum(torch.isnan(O))
-                        if (nan_count > 0):
-                            print()
-                            print(f"{nan_count} nans found")
-                            print(q_chunk)
-                            pytest.exit(0)
-                    L[batch, head, startI:endI] = l
+
+                    O[sliceI] /= l
+                    L[b, h, startI:endI] = m + torch.log(l)
 
             return O, L
 
