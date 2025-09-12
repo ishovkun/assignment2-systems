@@ -4,6 +4,7 @@ import torch
 from torch import Tensor
 from jaxtyping import Float, Bool, Int
 import math
+import os
 
 from einops import rearrange, einsum
 import torch.cuda.nvtx as nvtx
@@ -97,25 +98,36 @@ def get_random_batch(
 
 
 def run_benchmark(
-    model: BasicsTransformerLM, batch_size, num_reps: int, num_warmup_reps: int = 0):
+    model: BasicsTransformerLM,
+    batch_size,
+    num_reps: int,
+    num_warmup_reps: int = 0,
+    memory_profile: str | None = None,
+    dtype: torch.dtype = torch.float32
+):
     x = get_random_batch(model.vocab_size, batch_size, model.context_length).cuda()
     y = get_random_batch(model.vocab_size, batch_size, model.context_length).cuda()
 
     with nvtx.range("warmup"):
-        for i in range(num_warmup_reps):
-            logits = model.forward(x)
-            logits = logits.view(-1, logits.shape[-1])
-            y = y.view(-1)
+        with torch.autocast('cuda', dtype=dtype):
+            for i in range(num_warmup_reps):
+                logits = model.forward(x)
+                logits = logits.view(-1, logits.shape[-1])
+                y = y.view(-1)
 
-            loss = cross_entropy(logits, y)
-            loss.backward()
+                loss = cross_entropy(logits, y)
+                loss.backward()
     torch.cuda.synchronize()
+
+    if memory_profile is not None:
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
 
     # forward bench
     start = timeit.default_timer()
     with nvtx.range("forward"):
-        for i in range(num_reps):
-            logits = model.forward(x)
+        with torch.autocast('cuda', dtype=dtype):
+            for i in range(num_reps):
+                logits = model.forward(x)
     torch.cuda.synchronize()
     end = timeit.default_timer()
 
@@ -131,14 +143,27 @@ def run_benchmark(
 
     start = timeit.default_timer()
     with nvtx.range("backward"):
-        for i in range(num_reps):
-            loss.backward(retain_graph=True)
+        with torch.autocast('cuda', dtype=dtype):
+            for i in range(num_reps):
+                loss.backward(retain_graph=True)
     torch.cuda.synchronize()
     end = timeit.default_timer()
     elapsed = end - start
     backward_avg = elapsed / num_reps
+
+    if memory_profile is not None:
+        torch.cuda.memory._dump_snapshot(memory_profile)
+        torch.cuda.memory._record_memory_history(enabled=None)
+
     return forward_avg, backward_avg, forward_avg + backward_avg
 
+def append_suffix(path: str, suffix: str) -> str:
+    """
+    Takes a file path and a suffix, strips the file extension,
+    appends the suffix, and then adds back the file extension.
+    """
+    base, ext = os.path.splitext(path)
+    return f"{base}{suffix}{ext}"
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark configuration")
@@ -147,15 +172,29 @@ if __name__ == "__main__":
     parser.add_argument("--context_length", type=int, default="256", help="Batch size")
     parser.add_argument("--warmup", type=int, default="5", help="Number of warmup steps")
     parser.add_argument("--reps", type=int, default="10", help="Number of bench steps")
+    parser.add_argument("--mem", type=str, default=None, help="Memory profiler file")
+    parser.add_argument("--dtype", type=str, default="float32", help="Auto quantization")
+    print(type(torch.float32))
+
 
     args = parser.parse_args()
+    dtype: torch.dtype = getattr(torch, args.dtype)
 
     sizes = args.model_size.split(",")
     if sizes[0] == "all": sizes = ["small", "medium", "large", "xl", "2.7B"]
-    print(f"| Model | Num parameters [bil] | Time Forward [ms] | Time backward [ms] | Time Total [ms] |")
-    print(f"|------- | --------------------- | ----------- | ----------- | ----------- |")
+    print(f"| Model | dtype | Num parameters [bil] | Time Forward [ms] | Time backward [ms] | Time Total [ms] |")
+    print(f"|------- | ---- | --------------------- | ----------- | ----------- | ----------- |")
     for model_size in sizes:
         model_size = model_size.lstrip().rstrip()
         model = create_model(model_size, args.context_length)
-        tf, tb, tt = run_benchmark(model.cuda(), args.batch, num_reps=args.reps, num_warmup_reps=args.warmup)
-        print(f"|{model_size} | {(model.get_num_params()/1e9):2f} | {(tf*1000):.2f} | {(tb*1000):.2f} | {(tt*1000):.2f} |")
+        mem_profiler_output = args.mem
+        if mem_profiler_output is not None:
+            mem_profiler_output = append_suffix(mem_profiler_output, f"_{model_size}")
+
+        tf, tb, tt = run_benchmark(model.cuda(),
+            args.batch,
+            num_reps=args.reps,
+            num_warmup_reps=args.warmup,
+            memory_profile=mem_profiler_output,
+            dtype=dtype)
+        print(f"|{model_size} | {dtype} | {(model.get_num_params()/1e9):2f} | {(tf*1000):.2f} | {(tb*1000):.2f} | {(tt*1000):.2f} |")
