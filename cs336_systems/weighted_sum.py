@@ -80,7 +80,7 @@ def weighted_sum_backward(
     ROWS_TILE_SIZE: tl.constexpr, D_TILE_SIZE: tl.constexpr,
 ):
     row_tile_idx = tl.program_id(0)
-    n_row_tiles = tl.num_programs(0)
+    n_row_tiles = tl.num_programs(0) # gridDim.x
 
     # Inputs
     grad_output_block_ptr = tl.make_block_ptr(
@@ -214,9 +214,12 @@ if __name__ == "__main__":
     B = 600
     x = torch.randn(B, D, device='cuda', requires_grad=True)
     w = torch.randn(D, device='cuda', requires_grad=True)
+    print(f"x.stride(0) = {x.stride(0)}")
+    print(f"x.stride(1) = {x.stride(1)}")
 
-    z = WeightedSumFunc.apply(x, w)
-    print(z[:5])
-    y = weighted_sum(x, w)
-    print(y[:5])
-    z.backward()
+
+    # z = WeightedSumFunc.apply(x, w)
+    # print(z[:5])
+    # y = weighted_sum(x, w)
+    # print(y[:5])
+    # z.backward()
