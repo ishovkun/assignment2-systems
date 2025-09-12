@@ -23,7 +23,6 @@ def flash_attn_forward(
         seq_len = Q.shape[2]
         d_k = Q.shape[3]
         d_v = V.shape[3]
-        print(f"fattn for b={batch_size} h={num_heads} s={seq_len} d_k={d_k} d_v={d_v}")
 
         softmax_scale = 1. / (d_k**0.5)
         O = torch.zeros((batch_size, num_heads, seq_len, d_v), dtype=torch.float32)
