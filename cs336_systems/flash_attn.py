@@ -76,17 +76,19 @@ def flash_attn_forward_triton(
     o_stride_batch, o_stride_seq, o_stride_d,
     l_stride_batch, l_stride_seq,
     tile_size_q: tl.constexpr, tile_size_kv: tl.constexpr,
-    max_head_dim: tl.constexpr
+    max_head_dim: tl.constexpr,
+    is_causal: tl.constexpr
 ):
     batch = tl.program_id(1) # blockIdx.y
     query_tile_idx = tl.program_id(0)
     scale = 1. / max_head_dim**0.5
+    q_start = query_tile_idx * tile_size_q
 
     q_block_ptr = tl.make_block_ptr(
         q_ptr + batch * qk_stride_batch,
         shape=(seq_len, max_head_dim),
         strides=(qk_stride_seq, qk_stride_d),
-        offsets=(query_tile_idx * tile_size_q, 0,),
+        offsets=(q_start, 0,),
         block_shape=(tile_size_q, max_head_dim),
         order=(1, 0)
     )
@@ -113,7 +115,7 @@ def flash_attn_forward_triton(
         o_ptr + batch * o_stride_batch,
         shape=(seq_len, max_head_dim),
         strides=(o_stride_seq, o_stride_d),
-        offsets=(query_tile_idx * tile_size_q, 0,),
+        offsets=(q_start, 0,),
         block_shape=(tile_size_q, max_head_dim),
         order=(1, 0)
     )
@@ -122,7 +124,7 @@ def flash_attn_forward_triton(
         l_ptr + batch*l_stride_batch,
         shape=(seq_len, 1),
         strides=(l_stride_seq, 1),
-        offsets=(query_tile_idx *tile_size_q, 0),
+        offsets=(q_start, 0),
         block_shape=(tile_size_q, 1),
         order=(1,0)
     )
@@ -133,14 +135,23 @@ def flash_attn_forward_triton(
     l = tl.zeros((tile_size_q, 1), dtype=tl.float32)
     Oi = tl.zeros((tile_size_q, max_head_dim), dtype=tl.float32)
 
+    row_indices = q_start + tl.arange(0, tile_size_q)
+
     for j in range(tl.cdiv(seq_len, tile_size_kv)):
         # Load KV
         Kj = tl.load(k_block_ptr, boundary_check=(1,), padding_option='zero')
         Vj = tl.load(v_block_ptr, boundary_check=(1,), padding_option='zero')
 
-        # computeattention
-        # Sij = tl.dot(Qi, Kj.T) * scale
-        Sij = tl.dot(Qi, tl.trans(Kj)) * scale
+        k_start = j * tile_size_kv
+        k_end = (j+1) * tile_size_kv
+        col_indices = j*tile_size_kv + tl.arange(0, tile_size_kv)
+
+        # compute scores
+        Sij = tl.dot(Qi, Kj.T) * scale
+
+        if is_causal:
+            Sij = tl.where(row_indices[:,None] >= col_indices[None,:], Sij, float("-inf"))
+
 
         # Compute row maximum
         m_cur = tl.max(Sij, axis=-1, return_indices=False).reshape(tile_size_q, 1)
@@ -154,7 +165,7 @@ def flash_attn_forward_triton(
 
         PV = tl.dot(Pij.to(Vj.dtype), Vj)
 
-        # Update O
+        # Update weights
         Oi = tl.exp(m - m_new) * Oi + PV
 
         m = m_new
@@ -220,6 +231,7 @@ class FlashAttentionTriton(torch.autograd.Function):
         ctx.tile_size_q = 32
         ctx.tile_size_kv = 32
         ctx.max_head_dim = d_k
+        ctx.is_causal = causal
 
         grid = (batch_dim, triton.cdiv(seq_len, ctx.tile_size_q))
         O = torch.zeros((batch_dim, seq_len, d_v), dtype=torch.float32, device=Q.device)
@@ -233,7 +245,8 @@ class FlashAttentionTriton(torch.autograd.Function):
             L.stride(0), L.stride(1),
             tile_size_q = ctx.tile_size_q,
             tile_size_kv = ctx.tile_size_kv,
-            max_head_dim = ctx.max_head_dim
+            max_head_dim = ctx.max_head_dim,
+            is_causal=ctx.is_causal
         )
         # print(O[0, :, :])
         # pytest.exit(0)
