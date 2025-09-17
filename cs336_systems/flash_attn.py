@@ -14,35 +14,36 @@ def flash_attn_forward(
     Q: Float[Tensor, "batch queries d_k"],
     K: Float[Tensor, "batch keys    d_k"],
     V: Float[Tensor, "batch keys    d_v"],
-    causal: bool = False
+    causal: bool = False,
+    tileQ: int = 8,
+    tileKV: int = 16,
 ) -> tuple[Float[Tensor, " ... queries d_v"], Float[Tensor, "... queries"]]:
     assert len(Q.shape) == 3
     assert len(K.shape) == 3
     assert len(V.shape) == 3
 
     batch_dim = Q.shape[0]
-    seq_len = Q.shape[1]
+    num_queries = Q.shape[1]
+    num_keys = K.shape[1]
     d_k = Q.shape[2]
     d_v = V.shape[2]
 
     softmax_scale = 1. / (d_k**0.5)
-    O = torch.zeros((batch_dim, seq_len, d_v), dtype=torch.float32)
-    L = torch.zeros((batch_dim, seq_len, 1), dtype=torch.float32)
-    tileQ = 16
-    tileK = 16
+    O = torch.zeros((batch_dim, num_queries, d_v), dtype=torch.float32)
+    L = torch.zeros((batch_dim, num_queries, 1), dtype=torch.float32)
 
     for b in range(batch_dim):
-        for q_chunk in range(cdiv(seq_len, tileQ)):
+        for q_chunk in range(cdiv(num_queries, tileQ)):
             startI = q_chunk * tileQ
-            endI = min((q_chunk+1)*tileQ, seq_len)
+            endI = min((q_chunk+1)*tileQ, num_queries)
             sliceI = (b, slice(startI, endI), slice(None))
             m = torch.full((tileQ, 1), fill_value=-torch.inf, dtype=torch.float32)
             l = torch.zeros((tileQ, 1), dtype=torch.float32)
             Qi = Q[sliceI]
-            for kv_chunk in range(cdiv(seq_len, tileK)):
+            for kv_chunk in range(cdiv(num_keys, tileKV)):
                 # Load K,V
-                startJ = kv_chunk * tileK
-                endJ = min((kv_chunk+1)*tileK, seq_len)
+                startJ = kv_chunk * tileKV
+                endJ = min((kv_chunk+1)*tileKV, num_keys)
                 sliceJ = (b, slice(startJ, endJ), slice(None))
                 Kj = K[sliceJ]
                 Vj = V[sliceJ]
@@ -67,59 +68,59 @@ def flash_attn_forward(
 
     return O, L
 
-def flash_attn_backward(Q, K, V, O, dO, L):
+def flash_attn_backward(Q, K, V, O, dO, L, tileQ, tileKV):
     batch_dim = Q.shape[0]
-    seq_len = Q.shape[1]
+    num_queries = Q.shape[1]
+    assert(batch_dim == K.shape[0] == V.shape[0] == O.shape[0] == dO.shape[0] == L.shape[0])
+    num_keys = V.shape[1]
     d_k = Q.shape[2]
     d_v = V.shape[2]
+
     dQ = torch.zeros_like(Q, device=Q.device)
     dV = torch.zeros_like(V, device=V.device)
     dK = torch.zeros_like(K, device=K.device)
     softmax_scale = d_k**(-0.5)
 
-    tileQ = 16
-    tileK = 16
-    # D = einsum(O, dO, "... query d_v, ... query d_v -> ... query d_v").sum(axis=-1)
-    D = torch.empty((batch_dim, seq_len), device=O.device)
+    D = torch.empty((batch_dim, num_queries), device=O.device)
     for b in range(batch_dim):
-        for q_start in range(0, seq_len, tileK):
-            sliceI = slice(q_start, min(q_start + tileQ, seq_len))
+        for q_start in range(0, num_queries, tileQ):
+            sliceI = slice(q_start, min(q_start + tileQ, num_queries))
             OdOi = O[b, sliceI, :] * dO[b, sliceI, :]
             D[b, sliceI] = OdOi.sum(axis=-1)
 
     for b in range(batch_dim):
-        for kv_start in range(0, seq_len, tileK):
-            sliceJ = slice(kv_start, min(kv_start+tileK, seq_len))
+        for kv_start in range(0, num_keys, tileKV):
+            sliceJ = slice(kv_start, min(kv_start+tileKV, num_keys))
             Kj = K[b, sliceJ, :]
             Vj = V[b, sliceJ, :]
-            dVj = torch.zeros(tileK, d_v)
-            dKj = torch.zeros(tileK, d_k)
-            for q_start in range(0, seq_len, tileQ):
-                sliceI = slice(q_start, min(q_start + tileQ, seq_len))
+
+            dKj = torch.zeros(tileKV, d_k)
+            dVj = torch.zeros(tileKV, d_v)
+
+            for q_start in range(0, num_queries, tileQ):
+                # update dVj
+                sliceI = slice(q_start, min(q_start + tileQ, num_queries))
                 Qi = Q[b, sliceI, :] # tQ dk
                 Sij = einsum(Qi, Kj, "query d_k, key d_k -> query key") * softmax_scale # (tQ x tK)
-
-                Li = L[b, sliceI]
-                Pij = torch.exp(Sij - Li[:, None]) # (tQ x tK)
+                Li = L[b, sliceI].reshape(tileQ, 1)
+                Pij = torch.exp(Sij - Li) # (tQ x tK)
 
                 dOi = dO[b, sliceI, :] # tQ, d_v
 
                 # dVj += einsum(Pij, dOi, "query key, query d_v -> key d_v") # (k, d_v)
                 dVj += Pij.T @ dOi
 
-                dPij = einsum(dOi, Vj, "q d_v, k d_v -> q k") # (q, k)
-
-                Di = D[b, sliceI]
-                dSij = Pij * (dPij - Di[:, None]) * softmax_scale
+                # update dKj
+                dPij = dOi @ Vj.T
+                Di = D[b, sliceI].reshape(tileQ, 1)
+                dSij = Pij * (dPij - Di) * softmax_scale
+                dKj += dSij.T @ Qi
 
                 # update dQi += dSij @ Kj; must be atomic!!!!!!
                 dQ[b, sliceI, :] += einsum(dSij, Kj, "q k, k d_k -> q d_k")
 
-                dKj += einsum(dSij, Qi, "q k, q d_k -> k d_k")
-
             dV[b, sliceJ, :] = dVj
             dK[b, sliceJ, :] = dKj
-            # print(f"dV = {dV}")
 
     return dQ, dK, dV
 
@@ -242,7 +243,7 @@ def flash_attn_forward_triton(
 def compute_D_matrix(o_ptr, do_ptr, d_ptr,
     odo_stride_batch, odo_stride_seq, odo_stride_d,
     d_stride_batch, d_stride_seq,
-    seq_len, d_v,
+    num_queries, d_v,
     tile_size_seq: tl.constexpr, tile_size_d: tl.constexpr
 ):
     batch = tl.program_id(1)
@@ -251,7 +252,7 @@ def compute_D_matrix(o_ptr, do_ptr, d_ptr,
 
     o_block_ptr = tl.make_block_ptr(
         o_ptr + batch * odo_stride_batch,
-        shape=(seq_len, d_v),
+        shape=(num_queries, d_v),
         strides=(odo_stride_seq, odo_stride_d),
         offsets=(o_start, 0,),
         block_shape=(tile_size_seq, tile_size_d),
@@ -260,7 +261,7 @@ def compute_D_matrix(o_ptr, do_ptr, d_ptr,
 
     do_block_ptr = tl.make_block_ptr(
         do_ptr + batch * odo_stride_batch,
-        shape=(seq_len, d_v),
+        shape=(num_queries, d_v),
         strides=(odo_stride_seq, odo_stride_d),
         offsets=(o_start, 0,),
         block_shape=(tile_size_seq, tile_size_d),
@@ -269,7 +270,7 @@ def compute_D_matrix(o_ptr, do_ptr, d_ptr,
 
     d_block_ptr = tl.make_block_ptr(
         d_ptr + batch * d_stride_batch,
-        shape=(seq_len, 1),
+        shape=(num_queries, 1),
         strides=(d_stride_seq, 1),
         offsets=(o_start, 0),
         block_shape=(tile_size_seq, 1),
@@ -293,25 +294,24 @@ def flash_attn_backward_triton(
     do_ptr,
     l_ptr, d_ptr,
     dq_ptr, dk_ptr, dv_ptr,
-    seq_len,
-    qk_stride_batch, qk_stride_seq, qk_stride_d,
+    num_queries, num_keys, d_k, d_v,
+    q_stride_batch, q_stride_seq, q_stride_d,
+    k_stride_batch, k_stride_seq, k_stride_d,
     v_stride_batch, v_stride_seq, v_stride_d,
     o_stride_batch, o_stride_seq, o_stride_d,
-    dl_stride_batch, dl_stride_seq, dl_stride_d,
+    dl_stride_batch, dl_stride_seq,
     tileQ: tl.constexpr, tileKV: tl.constexpr, maxD: tl.constexpr,
     is_causal: tl.constexpr,
 ):
     batch = tl.program_id(1) # blockIdx.y
-    # query_tile_idx = tl.program_id(0)
-    # q_start = query_tile_idx * tileQ
-    kv_tile_idx = tl.program_id(0)
+    kv_tile_idx = tl.program_id(0)  # blockidx.x
     kv_start = kv_tile_idx * tileKV
-    scale = 1. / maxD**0.5
+    scale = maxD**(-0.5)
 
     k_block_ptr = tl.make_block_ptr(
-        k_ptr + batch * qk_stride_batch,
-        shape=(seq_len, maxD),
-        strides=(qk_stride_seq, qk_stride_d),
+        k_ptr + batch * k_stride_batch,
+        shape=(num_keys, d_k),
+        strides=(k_stride_seq, k_stride_d),
         offsets=(kv_start, 0),
         block_shape=(tileKV, maxD),
         order=(1, 0)
@@ -319,59 +319,26 @@ def flash_attn_backward_triton(
 
     v_block_ptr = tl.make_block_ptr(
         v_ptr + batch * v_stride_batch,
-        shape=(seq_len, maxD),
+        shape=(num_keys, d_v),
         strides=(v_stride_seq, v_stride_d),
         offsets=(kv_start, 0),
         block_shape=(tileKV, maxD),
         order=(1, 0)
     )
 
-
-    dk_block_ptr = tl.make_block_ptr(
-        dk_ptr + batch * qk_stride_batch,
-        shape=(seq_len, maxD),
-        strides=(qk_stride_seq, qk_stride_d),
-        offsets=(kv_start, 0),
-        block_shape=(tileKV, maxD),
-        order=(1, 0)
-    )
-
-    dv_block_ptr = tl.make_block_ptr(
-        dv_ptr + batch * v_stride_batch,
-        shape=(seq_len, maxD),
-        strides=(v_stride_seq, v_stride_d),
-        offsets=(kv_start, 0),
-        block_shape=(tileKV, maxD),
-        order=(1, 0)
-    )
-
-    Kj = tl.load(k_block_ptr, boundary_check=(1,), padding_option='zero')
-    Vj = tl.load(v_block_ptr, boundary_check=(1,), padding_option='zero')
-    dKj = tl.zeros((tileKV, maxD), dtype=Kj.dtype)
-    dVj = tl.zeros((tileKV, maxD), dtype=Vj.dtype)
-    # tl.device_print(f"dKj.shape = {dKj.shape[0]}, {dKj.shape[1]}")
 
     q_block_ptr = tl.make_block_ptr(
-        q_ptr + batch * qk_stride_batch,
-        shape=(seq_len, maxD),
-        strides=(qk_stride_seq, qk_stride_d),
+        q_ptr + batch * q_stride_batch,
+        shape=(num_queries, d_k),
+        strides=(q_stride_seq, q_stride_d),
         offsets=(0, 0,),
         block_shape=(tileQ, maxD),
         order=(1, 0)
     )
 
-    # dq_block_ptr = tl.make_block_ptr(
-    #     dq_ptr + batch * qk_stride_batch,
-    #     shape=(seq_len, maxD),
-    #     strides=(qk_stride_seq, qk_stride_d),
-    #     offsets=(0, 0,),
-    #     block_shape=(tileQ, maxD),
-    #     order=(1, 0)
-    # )
-
     do_block_ptr = tl.make_block_ptr(
         do_ptr + batch * o_stride_batch,
-        shape=(seq_len, maxD),
+        shape=(num_queries, d_v),
         strides=(o_stride_seq, o_stride_d),
         offsets=(0, 0),
         block_shape=(tileQ, maxD),
@@ -380,7 +347,7 @@ def flash_attn_backward_triton(
 
     l_block_ptr = tl.make_block_ptr(
         l_ptr + batch*dl_stride_batch,
-        shape=(seq_len, 1),
+        shape=(num_queries, 1),
         strides=(dl_stride_seq, 1),
         offsets=(0, 0),
         block_shape=(tileQ, 1),
@@ -389,49 +356,66 @@ def flash_attn_backward_triton(
 
     d_block_ptr = tl.make_block_ptr(
         d_ptr + batch*dl_stride_batch,
-        shape=(seq_len, 1),
+        shape=(num_queries, 1),
         strides=(dl_stride_seq, 1),
         offsets=(0, 0),
         block_shape=(tileQ, 1),
         order=(1,0)
     )
 
-    for q_start in range(0, seq_len, tileQ):
-        Qi = tl.load(q_block_ptr, boundary_check=(1,), padding_option='zero')
-        Sij = tl.dot(Qi, Kj.T) * scale # (tQ x tK)
-        # tl.device_print(f"Sij.shape = {Sij.shape[0]}, {Sij.shape[1]}") # 32 x 32
+    Kj = tl.load(k_block_ptr, boundary_check=(1,), padding_option='zero')
+    Vj = tl.load(v_block_ptr, boundary_check=(1,), padding_option='zero')
+    dKj = tl.zeros((tileKV, maxD), dtype=tl.float32)
+    dVj = tl.zeros((tileKV, maxD), dtype=tl.float32)
 
-        Li = tl.load(l_block_ptr, boundary_check=(1,), ).reshape(tileQ, 1)
-        # Pij = tl.exp(Sij - Li[:, None])  # (tQ x tKV)
-        Pij = tl.exp(Sij - Li)  # (tQ x tKV)
-
+    for q_start in range(0, num_queries, tileQ):
+        Qi = tl.load(q_block_ptr, boundary_check=(1,), padding_option='zero')   # (tQ x d_k)
+        Li = tl.load(l_block_ptr, boundary_check=(1,), padding_option='zero')   # (tQ x 1)
         dOi = tl.load(do_block_ptr, boundary_check=(1,), padding_option='zero') # (tQ x d_v)
 
+        # update dVj
+        Sij = tl.dot(Qi, Kj.T) * scale # (tQ x tK)
+        Pij = tl.exp(Sij - Li)  # (tQ x tKV)
         dVj += tl.dot(Pij.T, dOi)  # (tKV x d_v) = (tKV x tQ) @ (tQ x d_v)
 
+        # update dKj
         dPij = tl.dot(dOi, Vj.T)
-
         Di = tl.load(d_block_ptr, boundary_check=(1,),).reshape(tileQ, 1)
         dSij = Pij * (dPij - Di) * scale
+        dKj += tl.dot(dSij.T, Qi)
 
-        # dQi = tl.load(q_block_ptr, boundary_check=(1,), padding_option='zero')
         delta_dQi = tl.dot(dSij, Kj)
 
-        # Create 2D pointer array for atomic add
+        # Atomically update dQ
         q_row_idx = q_start + tl.arange(0, tileQ)[:, None]  # Current query rows
         q_col_idx = tl.arange(0, maxD)[None, :]             # All feature dimensions
-        q_mask = (q_row_idx < seq_len) & (q_col_idx < maxD)
-
-        dq_ptrs = dq_ptr + batch * qk_stride_batch + q_row_idx * qk_stride_seq + q_col_idx * qk_stride_d
+        q_mask = (q_row_idx < num_queries) & (q_col_idx < maxD)
+        dq_ptrs = dq_ptr + batch * q_stride_batch + q_row_idx * q_stride_seq + q_col_idx * q_stride_d
         tl.atomic_add(dq_ptrs, delta_dQi, mask=q_mask)
-
-        dKj += tl.dot(dSij.T, Qi)
 
         q_block_ptr = q_block_ptr.advance((tileQ, 0))
         l_block_ptr = l_block_ptr.advance((tileQ, 0))
         d_block_ptr = d_block_ptr.advance((tileQ, 0))
-        # dq_block_ptr = dq_block_ptr.advance((tileQ, 0))
         do_block_ptr = do_block_ptr.advance((tileQ, 0))
+
+    # store dK, dV
+    dk_block_ptr = tl.make_block_ptr(
+        dk_ptr + batch * q_stride_batch,
+        shape=(num_keys, d_k),
+        strides=(q_stride_seq, q_stride_d),
+        offsets=(kv_start, 0),
+        block_shape=(tileKV, maxD),
+        order=(1, 0)
+    )
+
+    dv_block_ptr = tl.make_block_ptr(
+        dv_ptr + batch * v_stride_batch,
+        shape=(num_keys, d_v),
+        strides=(v_stride_seq, v_stride_d),
+        offsets=(kv_start, 0),
+        block_shape=(tileKV, maxD),
+        order=(1, 0)
+    )
 
     tl.store(dk_block_ptr, dKj, boundary_check=(1,))
     tl.store(dv_block_ptr, dVj, boundary_check=(1,))
@@ -453,7 +437,12 @@ class FlashAttentionTorch(torch.autograd.Function):
             K = rearrange(Q, "... seq d_k -> (...) seq d_k")
             V = rearrange(Q, "... seq d_v -> (...) seq d_v")
 
-        O, L = flash_attn_forward(Q, K, V, causal)
+        num_queries = Q.shape[1]
+        num_keys = K.shape[1]
+        ctx.tileQ = min(8, num_queries)
+        ctx.tileKV = min(16, num_keys)
+
+        O, L = flash_attn_forward(Q, K, V, causal, ctx.tileQ, ctx.tileKV)
         L = rearrange(L, "batch seq 1 -> batch seq")
 
         ctx.save_for_backward(Q, K, V, O, L)
@@ -465,7 +454,7 @@ class FlashAttentionTorch(torch.autograd.Function):
     def backward(ctx, dO):
         Q, K, V, O, L = ctx.saved_tensors
 
-        dQ, dK, dV = flash_attn_backward(Q, K, V, O, dO, L)
+        dQ, dK, dV = flash_attn_backward(Q, K, V, O, dO, L, ctx.tileQ, ctx.tileKV)
         dCausal = None
         return dQ, dK, dV, dCausal
 
@@ -489,8 +478,8 @@ class FlashAttentionTriton(torch.autograd.Function):
         d_k = Q.shape[2]
         d_v = V.shape[2]
 
-        ctx.tile_size_q = 32
-        ctx.tile_size_kv = 32
+        ctx.tile_size_q = 16
+        ctx.tile_size_kv = 16
         ctx.max_head_dim = d_k
         ctx.is_causal = causal
 
@@ -529,43 +518,46 @@ class FlashAttentionTriton(torch.autograd.Function):
         dCausal = None
 
         batch_dim = Q.shape[0]
-        seq_len = Q.shape[1]
+        num_queries = Q.shape[1]
+        num_keys = K.shape[1]
         d_k = Q.shape[2]
         d_v = V.shape[2]
 
         # D = torch.empty((batch_dim, seq_len), device=O.device)
-        D = torch.empty((batch_dim, seq_len), device=O.device)
+        D = torch.empty((batch_dim, num_queries), device=O.device)
         ctx.tile_size_seq = 4
         ctx.tile_size_d = 1*32
-        grid = (batch_dim, triton.cdiv(seq_len, ctx.tile_size_seq))
-
+        # grid = (batch_dim, triton.cdiv(num_queries, ctx.tile_size_seq))
+        grid = (triton.cdiv(num_queries, ctx.tile_size_seq), batch_dim)
         compute_D_matrix[grid](
             O, dO, D,
             O.stride(0), O.stride(1), O.stride(2),
             D.stride(0), D.stride(1),
-            seq_len, d_v,
+            num_queries, d_v,
             tile_size_seq=ctx.tile_size_seq,
             tile_size_d=ctx.tile_size_d,
         )
 
-        grid = (batch_dim, triton.cdiv(seq_len, ctx.tile_size_q))
+        # grid = (batch_dim, triton.cdiv(num_keys, ctx.tile_size_kv))
+        grid = (triton.cdiv(num_keys, ctx.tile_size_kv), batch_dim)
         flash_attn_backward_triton[grid] (
             Q, K, V, O,
             dO,
             L, D,
             dQ, dK, dV,
-            seq_len,
+            num_queries, num_keys, d_k, d_v,
             Q.stride(0), Q.stride(1), Q.stride(2),
+            K.stride(0), K.stride(1), K.stride(2),
             V.stride(0), V.stride(1), V.stride(2),
             O.stride(0), O.stride(1), O.stride(2),
-            D.stride(0), D.stride(1), 1,
+            D.stride(0), D.stride(1),
             tileQ=ctx.tile_size_q,
             tileKV=ctx.tile_size_kv,
             maxD=ctx.max_head_dim,
             is_causal=ctx.is_causal
         )
 
-
+        print(dK[0])
 
         # pytest.exit(0)
         return dQ, dK, dV, dCausal
