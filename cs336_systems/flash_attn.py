@@ -133,6 +133,20 @@ def flash_attn_forward_triton(
     v_stride_batch, v_stride_seq, v_stride_d,
     o_stride_batch, o_stride_seq, o_stride_d,
     l_stride_batch, l_stride_seq,
+    # q_ptr: tl.pointer_type,
+    # k_ptr: tl.pointer_type,
+    # v_ptr: tl.pointer_type,
+    # o_ptr: tl.pointer_type,
+    # l_ptr: tl.pointer_type,
+    # num_queries: int,
+    # num_keys: int,
+    # d_k: int,
+    # d_v: int,
+    # q_stride_batch: int, q_stride_seq: int, q_stride_d: int,
+    # k_stride_batch: int, k_stride_seq:int , k_stride_d: int,
+    # v_stride_batch: int, v_stride_seq: int, v_stride_d: int,
+    # o_stride_batch: int, o_stride_seq: int, o_stride_d: int,
+    # l_stride_batch: int, l_stride_seq: int,
     tileQ: tl.constexpr,
     tileKV: tl.constexpr,
     maxD: tl.constexpr,
@@ -370,13 +384,18 @@ def flash_attn_backward_triton(
     dKj = tl.zeros((tileKV, maxD), dtype=tl.float32)
     dVj = tl.zeros((tileKV, maxD), dtype=tl.float32)
 
+    col_indices = kv_start + tl.arange(0, tileKV)
+
     for q_start in range(0, num_queries, tileQ):
+        row_indices = q_start + tl.arange(0, tileQ)
         Qi = tl.load(q_block_ptr, boundary_check=(1,), padding_option='zero')   # (tQ x d_k)
         Li = tl.load(l_block_ptr, boundary_check=(1,), padding_option='zero')   # (tQ x 1)
         dOi = tl.load(do_block_ptr, boundary_check=(1,), padding_option='zero') # (tQ x d_v)
 
         # update dVj
         Sij = tl.dot(Qi, Kj.T) * scale # (tQ x tK)
+        if is_causal:
+            Sij = tl.where(row_indices[:,None] >= col_indices[None,:], Sij, float("-inf"))
         Pij = tl.exp(Sij - Li)  # (tQ x tKV)
         dVj += tl.dot(Pij.T, dOi)  # (tKV x d_v) = (tKV x tQ) @ (tQ x d_v)
 
@@ -514,7 +533,7 @@ class FlashAttentionTriton(torch.autograd.Function):
                Float[Tensor, "... values d_v"],  # dV
                None]: # None as is_causal is not differentiable
         Q, K, V, O, L = ctx.saved_tensors
-        print(f"\nctx.is_causal = {ctx.is_causal}")
+        # print(f"\nctx.is_causal = {ctx.is_causal}")
 
         dQ = torch.zeros_like(Q, device=Q.device)
         dK = torch.empty_like(K, device=K.device)
@@ -559,7 +578,4 @@ class FlashAttentionTriton(torch.autograd.Function):
             is_causal=ctx.is_causal
         )
 
-        print(dV[0])
-
-        # pytest.exit(0)
         return dQ, dK, dV, dCausal
