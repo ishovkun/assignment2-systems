@@ -29,16 +29,16 @@ def flash_attn_forward(
     d_v = V.shape[2]
 
     softmax_scale = 1. / (d_k**0.5)
-    O = torch.zeros((batch_dim, num_queries, d_v), dtype=torch.float32)
-    L = torch.zeros((batch_dim, num_queries, 1), dtype=torch.float32)
+    O = torch.zeros((batch_dim, num_queries, d_v), dtype=torch.float32, device=Q.device)
+    L = torch.zeros((batch_dim, num_queries, 1), dtype=torch.float32, device=Q.device)
 
     for b in range(batch_dim):
         for q_chunk in range(cdiv(num_queries, tileQ)):
             startI = q_chunk * tileQ
             endI = min((q_chunk+1)*tileQ, num_queries)
             sliceI = (b, slice(startI, endI), slice(None))
-            m = torch.full((tileQ, 1), fill_value=-torch.inf, dtype=torch.float32)
-            l = torch.zeros((tileQ, 1), dtype=torch.float32)
+            m = torch.full((tileQ, 1), fill_value=-torch.inf, dtype=torch.float32, device=Q.device)
+            l = torch.zeros((tileQ, 1), dtype=torch.float32, device=Q.device)
             Qi = Q[sliceI]
             for kv_chunk in range(cdiv(num_keys, tileKV)):
                 # Load K,V
@@ -50,7 +50,7 @@ def flash_attn_forward(
                 # Compute QK
                 Sij = einsum(Qi, Kj, "query d_k, key d_k -> query key") * softmax_scale
                 # Compute new row-max
-                m_cur = torch.max(Sij, dim=-1)[0].reshape(tileQ, 1)
+                m_cur = torch.max(Sij, dim=-1)[0].reshape(tileQ, 1).to()
                 m_new = torch.max(torch.stack( (m_cur, m) , dim=-1), dim=-1, keepdim=False)[0]
                 Pij = torch.exp(Sij - m_new)
                 # Compute row-sum
@@ -94,8 +94,8 @@ def flash_attn_backward(Q, K, V, O, dO, L, tileQ, tileKV):
             Kj = K[b, sliceJ, :]
             Vj = V[b, sliceJ, :]
 
-            dKj = torch.zeros(tileKV, d_k)
-            dVj = torch.zeros(tileKV, d_v)
+            dKj = torch.zeros(tileKV, d_k, device=Q.device)
+            dVj = torch.zeros(tileKV, d_v, device=Q.device)
 
             for q_start in range(0, num_queries, tileQ):
                 # update dVj
@@ -124,6 +124,14 @@ def flash_attn_backward(Q, K, V, O, dO, L, tileQ, tileKV):
 
     return dQ, dK, dV
 
+@triton.autotune(configs=[
+    triton.Config(kwargs={'tileQ': 64, 'tileKV': 32}, num_warps=2),
+    triton.Config(kwargs={'tileQ': 64, 'tileKV': 32}, num_warps=4),
+    triton.Config(kwargs={'tileQ': 64, 'tileKV': 32}, num_warps=8),
+    triton.Config(kwargs={'tileQ': 128, 'tileKV': 64}, num_warps=8),
+    ],
+    key=['num_queries'] # evaluated anytime the value of num_queqries changes
+)
 @triton.jit
 def flash_attn_forward_triton(
     q_ptr, k_ptr, v_ptr, o_ptr, l_ptr,
@@ -133,20 +141,6 @@ def flash_attn_forward_triton(
     v_stride_batch, v_stride_seq, v_stride_d,
     o_stride_batch, o_stride_seq, o_stride_d,
     l_stride_batch, l_stride_seq,
-    # q_ptr: tl.pointer_type,
-    # k_ptr: tl.pointer_type,
-    # v_ptr: tl.pointer_type,
-    # o_ptr: tl.pointer_type,
-    # l_ptr: tl.pointer_type,
-    # num_queries: int,
-    # num_keys: int,
-    # d_k: int,
-    # d_v: int,
-    # q_stride_batch: int, q_stride_seq: int, q_stride_d: int,
-    # k_stride_batch: int, k_stride_seq:int , k_stride_d: int,
-    # v_stride_batch: int, v_stride_seq: int, v_stride_d: int,
-    # o_stride_batch: int, o_stride_seq: int, o_stride_d: int,
-    # l_stride_batch: int, l_stride_seq: int,
     tileQ: tl.constexpr,
     tileKV: tl.constexpr,
     maxD: tl.constexpr,
@@ -154,7 +148,7 @@ def flash_attn_forward_triton(
 ):
     batch = tl.program_id(1) # blockIdx.y
     query_tile_idx = tl.program_id(0)
-    scale = 1. / maxD**0.5
+    scale = maxD**(-0.5)
     q_start = query_tile_idx * tileQ
 
     q_block_ptr = tl.make_block_ptr(
@@ -224,7 +218,6 @@ def flash_attn_forward_triton(
 
         if is_causal:
             Sij = tl.where(row_indices[:,None] >= col_indices[None,:], Sij, float("-inf"))
-
 
         # Compute row maximum
         m_cur = tl.max(Sij, axis=-1, return_indices=False).reshape(tileQ, 1)
@@ -455,13 +448,15 @@ class FlashAttentionTorch(torch.autograd.Function):
 
         if len(Q.shape) > 3:
             Q = rearrange(Q, "... seq d_k -> (...) seq d_k")
-            K = rearrange(Q, "... seq d_k -> (...) seq d_k")
-            V = rearrange(Q, "... seq d_v -> (...) seq d_v")
+            K = rearrange(K, "... seq d_k -> (...) seq d_k")
+            V = rearrange(V, "... seq d_v -> (...) seq d_v")
 
         num_queries = Q.shape[1]
         num_keys = K.shape[1]
-        ctx.tileQ = min(8, num_queries)
-        ctx.tileKV = min(16, num_keys)
+        # ctx.tileQ = min(8, num_queries)
+        # ctx.tileKV = min(16, num_keys)
+        ctx.tileQ = min(2**13, num_queries)
+        ctx.tileKV = min(2**13, num_keys)
 
         O, L = flash_attn_forward(Q, K, V, causal, ctx.tileQ, ctx.tileKV)
         L = rearrange(L, "batch seq 1 -> batch seq")
@@ -516,8 +511,8 @@ class FlashAttentionTriton(torch.autograd.Function):
             V.stride(0), V.stride(1), V.stride(2),
             O.stride(0), O.stride(1), O.stride(2),
             L.stride(0), L.stride(1),
-            tileQ = ctx.tile_size_q,
-            tileKV = ctx.tile_size_kv,
+            # tileQ = ctx.tile_size_q,
+            # tileKV = ctx.tile_size_kv,
             maxD = ctx.max_head_dim,
             is_causal=ctx.is_causal
         )

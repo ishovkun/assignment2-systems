@@ -16,24 +16,32 @@
         "reveal_target": "dock",
         "hide": "never",
         "shell": "system"
-    },
-    {
-        "label": "Benchmark Attention",
-        "command": "uv run ./cs336_systems/benchmark_attn.py",
-        "args": ["small"],
-        "env": { "foo": "bar" },
-        // Current working directory to spawn the command into, defaults to current project root.
-        //"cwd": "/path/to/working/directory",
-        // Whether to use a new terminal tab or reuse the existing one to spawn the process, defaults to `false`.
-        "use_new_terminal": false,
-        "allow_concurrent_runs": false,
-        "reveal": "always",
-        "reveal_target": "dock",
-        "hide": "never",
-        "shell": "system"
-    },
-    {
-        "label": "test flash_pytorch",
+    // },
+    // {
+    //     "label": "Benchmark Attention [all]",
+    //     "command": "uv run ./cs336_systems/benchmark_attn.py",
+    //     "args": [
+    //       "--warmup=1.",
+    //       "--rep=4.",
+    //       "--dtype=float32",
+    //       // "--dtype=float16",
+    //       "--seq_len=32,64,128,256,512,1024,2048" //, 4096, 8192, 16384, 32768, 65536"
+    //     ]
+    // },
+    // {
+    //     "label": "Benchmark kernel",
+    //     "command": "uv run ./cs336_systems/benchmark_attn.py",
+    //     "args": [
+    //       "--warmup=2.",
+    //       "--rep=8.",
+    //       "--seq_len=2048",
+    //       "--dtype=float32",
+    //       "--kernels=forward_flash_triton,backward_flash_triton"
+    //       // "--kernels=forward_flash_triton"
+    //     ]
+    // },
+    // {
+    //     "label": "test flash_pytorch",
         "command": "uv run pytest -k test_flash_forward_pass_pytorch"
     },
     {

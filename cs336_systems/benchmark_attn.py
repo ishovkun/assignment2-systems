@@ -2,9 +2,12 @@ import argparse
 import torch
 import torch.cuda.nvtx as nvtx
 import cs336_basics.model as model
+from einops import rearrange, einsum
 import timeit
 from types import SimpleNamespace
+import flash_attn
 import torch._dynamo
+import triton
 
 def run_benchmark(q, k, v, fn, args):
     params = SimpleNamespace(**args)
@@ -30,76 +33,158 @@ def run_benchmark(q, k, v, fn, args):
     fn_time = elapsed / params.num_reps
     return fn_time
 
+class BenchmarkContext:
+    def __init__(self, name, dtype):
+        self.name = name
+        self.dtype = dtype
+        self.autocast_ctx = torch.autocast('cuda', dtype=self.dtype)
+
+    def __enter__(self):
+        self.autocast_ctx.__enter__()
+        return self.name
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.autocast_ctx.__exit__(exc_type, exc_val, exc_tb)
+
+def run_suite(params):
+    batch_size = params.batch_size
+    num_heads = params.num_heads
+    context_length = params.context_length
+    d_model = params.d_model
+
+
+    print("##################################################################")
+    print(f"########### Running suite [seq_len = {context_length} d_model = {d_model}] ###########")
+    print("##################################################################")
+
+
+    q = torch.randn(batch_size, num_heads, context_length, d_model, device='cuda', requires_grad=True)
+    k = torch.randn(batch_size, num_heads, context_length, d_model, device='cuda', requires_grad=True)
+    v = torch.randn(batch_size, num_heads, context_length, d_model, device='cuda', requires_grad=True)
+
+    results = {
+       "batch_size" : batch_size,
+       "seq_len"  : seq_len,
+       "d_model" : d_model,
+       "dtype" : params.dtype
+    }
+
+    causal_mask = torch.tril(torch.ones(context_length, context_length)) == 1
+    causal_mask = causal_mask.to('cuda')
+
+    torch.set_float32_matmul_precision('high')
+    torch._functorch.config.donated_buffer = False # for backward opt
+    attn_compiled = torch.compile(model.scaled_dot_product_attention)
+
+    with BenchmarkContext("forward naive", params.dtype) as name:
+        if "forward_naive" in params.kernels:
+            attention_fn = lambda:  model.scaled_dot_product_attention(q, k, v, mask=causal_mask)
+            res = triton.testing.do_bench(attention_fn, warmup=params.warmup, rep=params.rep)
+            print(f"Benchmark {name} took {res}")
+            results[name] = res
+
+    with BenchmarkContext("forward torch_compiled", params.dtype) as name:
+        if "forward_torch_compiled" in params.kernels:
+            attention_fn = lambda:  attn_compiled(q, k, v, mask=causal_mask)
+            res = triton.testing.do_bench(attention_fn, warmup=params.warmup, rep=params.rep)
+            print(f"Benchmark {name} took {res}")
+            results[name] = res
+
+    if len(q.shape) > 3:
+        q = rearrange(q, "... seq d_k -> (...) seq d_k")
+        k = rearrange(k, "... seq d_k -> (...) seq d_k")
+        v = rearrange(v, "... seq d_v -> (...) seq d_v")
+
+    with BenchmarkContext("forward flash_torch", params.dtype) as name:
+        if "forward_flash_torch" in params.kernels:
+            attention_fn = lambda: flash_attn.FlashAttentionTorch.apply(q, k, v, True)
+            res = triton.testing.do_bench(attention_fn, warmup=params.warmup, rep=params.rep)
+            print(f"Benchmark {name} took {res}")
+            results[name] = res
+
+    with BenchmarkContext("forward flash_triton", params.dtype) as name:
+        if "forward_flash_triton" in params.kernels:
+            attention_fn = lambda: flash_attn.FlashAttentionTriton.apply(q, k, v, True)
+            res = triton.testing.do_bench(attention_fn, warmup=params.warmup, rep=params.rep)
+            print(f"Benchmark {name} took {res}")
+            results[name] = res
+
+    with BenchmarkContext("backward naive", params.dtype) as name:
+        if "backward_naive" in params.kernels:
+            O = model.scaled_dot_product_attention(q, k, v, mask=causal_mask)
+            loss = O.sum()
+            attention_fn = lambda:  loss.backward(retain_graph=True)
+            res = triton.testing.do_bench(attention_fn, warmup=params.warmup, rep=params.rep)
+            print(f"Benchmark {name} took {res}")
+            results[name] = res
+
+    with BenchmarkContext("backward compiled", params.dtype) as name:
+        if "backward_compiled" in params.kernels:
+            O = attn_compiled(q, k, v, mask=causal_mask)
+            loss = O.sum()
+            attention_fn = lambda:  loss.backward(retain_graph=True)
+            res = triton.testing.do_bench(attention_fn, warmup=params.warmup, rep=params.rep)
+            print(f"Benchmark {name} took {res}")
+            results[name] = res
+
+    with BenchmarkContext("backward flash_torch", params.dtype) as name:
+        if "backward_flash_torch" in params.kernels:
+            O = flash_attn.FlashAttentionTorch.apply(q, k, v, True)
+            loss = O.sum()
+            attention_fn = lambda:  loss.backward(retain_graph=True)
+            res = triton.testing.do_bench(attention_fn, warmup=params.warmup, rep=params.rep)
+            print(f"Benchmark {name} took {res}")
+            results[name] = res
+
+    with BenchmarkContext("backward flash_triton", params.dtype) as name:
+        if "backward_flash_triton" in params.kernels:
+            O = flash_attn.FlashAttentionTriton.apply(q, k, v, True)
+            loss = O.sum()
+            attention_fn = lambda:  loss.backward(retain_graph=True)
+            res = triton.testing.do_bench(attention_fn, warmup=params.warmup, rep=params.rep)
+            print(f"Benchmark {name} took {res}")
+            results[name] = res
+
+    return results
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark configuration")
-    parser.add_argument("model_size", type=str, default="small", nargs="?", help="model size = [small, medium, large, xl, 2.7B")
-    parser.add_argument("--batch", type=int, default="4", help="Batch size")
-    parser.add_argument("--context_length", type=int, default="256", help="Batch size")
-    parser.add_argument("--warmup", type=int, default="5", help="Number of warmup steps")
-    parser.add_argument("--reps", type=int, default="10", help="Number of bench steps")
-    parser.add_argument("--mem", type=str, default=None, help="Memory profiler file")
-    parser.add_argument("--dtype", type=str, default="float32", help="Auto quantization")
+    _ = parser.add_argument("--batch", type=int, default="1")
+    _ = parser.add_argument("--seq_len", type=str, default="128,256")
+    _ = parser.add_argument("--d_model", type=str, default='128')
+    _ = parser.add_argument("--warmup", type=float, default="0.1")
+    _ = parser.add_argument("--rep", type=float, default="0.1")
+    _ = parser.add_argument("--dtype", type=str, default="float32")
+    all_models = [ 'forward_naive', 'forward_torch_compiled', 'forward_flash_torch',
+       'forward_flash_triton', 'backward_naive', 'backward_compiled',
+       'backward_flash_torch', 'backward_flash_triton',
+    ]
+    all_models_str = ','.join(all_models)
+    _ = parser.add_argument("--kernels", type=str, default=all_models_str)
 
     args = parser.parse_args()
 
-    params : dict = {}
+    params = {}
     params['dtype'] = getattr(torch, args.dtype)
-    params['warmup'] = args.warmup
-    params['memory_profile'] = args.mem
-    params['num_reps'] = args.reps
+    params['warmup'] = args.warmup * 1000.
+    params['rep'] = args.rep * 1000.
+    params['num_heads'] = 1
+    params['batch_size'] = args.batch
+    params['kernels'] = args.kernels.split(",")
 
+    seq_len = [int(x) for x in args.seq_len.split(",")]
+    d_model = [int(x) for x in args.d_model.split(",")]
 
-    sizes = args.model_size.split(",")
-    if sizes[0] == "all": sizes = ["small", "medium", "large", "xl", "2.7B"]
-    # print(f"| Model | dtype | Num parameters [bil] | Time Forward [ms] | Time backward [ms] | Time Total [ms] |")
-    # print(f"|------- | ---- | --------------------- | ----------- | ----------- | ----------- |")
-    for model_size in sizes:
-        model_size = model_size.lstrip().rstrip()
-        print(f"##########\nRunning model {model_size}\n##########")
+    all_results = []
+    for seq_len in seq_len:
+        for head_dim in d_model:
+            params['context_length'] = seq_len
+            params['d_model'] = head_dim
+            par = SimpleNamespace(**params)
+            results = run_suite(par)
+            print(results)
+            all_results.append(results)
 
-        batch_size = args.batch
-        context_length = args.context_length
-        if model_size == "small":
-            d_model = 768
-            num_heads = 12
-        elif model_size == "medium":
-            d_model = 1024
-            num_heads = 16
-        elif model_size == "large":
-            d_model = 1280
-            num_heads = 20
-        elif model_size == "xl":
-            num_heads = 25
-            d_model = 1600
-        elif model_size == "2.7B":
-            num_heads = 32
-            d_model = 2560
-        else:
-            raise NotImplementedError
-
-
-        q = torch.randn(batch_size, num_heads, context_length, d_model, device='cuda', requires_grad=True)
-        k = torch.randn(batch_size, num_heads, context_length, d_model, device='cuda', requires_grad=True)
-        v = torch.randn(batch_size, num_heads, context_length, d_model, device='cuda', requires_grad=True)
-
-
-        report: dict[str, float] = {}
-        report['naive'] = run_benchmark(q, k, v, model.scaled_dot_product_attention, params)
-        print(f"Benchmark 'naive' took {report['naive']}")
-
-        torch.set_float32_matmul_precision('high')
-        attn_compiled = torch.compile(model.scaled_dot_product_attention)
-
-        report['torch_compiled'] = run_benchmark(q, k, v, attn_compiled, params)
-        print(f"Benchmark 'torch_compiled' took {report['torch_compiled']}")
-
-        # print(report)
-
-        speedup = report['naive'] / report['torch_compiled']
-        print(f"speedup = {speedup}")
-        # model = create_model(model_size, args.context_length)
-        # mem_profiler_output = args.mem
-        # # if mem_profiler_output is not None:
-        #     mem_profiler_output = append_suffix(mem_profiler_output, f"_{model_size}")
-
-        # print(f"|{model_size} | {dtype} | {(model.get_num_params()/1e9):2f} | {(tf*1000):.2f} | {(tb*1000):.2f} | {(tt*1000):.2f} |")
+    print("all results")
+    for result in all_results:
+        print(result, end=',\n')
